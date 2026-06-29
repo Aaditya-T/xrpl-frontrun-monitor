@@ -12,6 +12,7 @@ const DEFAULT_DETECTOR = {
   maxCrossLedgerTxGap: 60,
   minVictimVolumeRatio: 0.15,
   minVictimRateMoveBps: 0,
+  minRoundTripVolumeRatio: 0.5,
   historySize: 2500
 };
 
@@ -189,7 +190,8 @@ async function scanLedgerRange(options, progress, gate) {
     maxLedgerGap: options.maxLedgerGap,
     maxTxGap: options.maxTxGap,
     maxCrossLedgerTxGap: options.maxCrossLedgerTxGap ?? DEFAULT_DETECTOR.maxCrossLedgerTxGap,
-    minVictimVolumeRatio: options.minVictimVolumeRatio
+    minVictimVolumeRatio: options.minVictimVolumeRatio,
+    minRoundTripVolumeRatio: options.minRoundTripVolumeRatio ?? DEFAULT_DETECTOR.minRoundTripVolumeRatio
   };
 
   const alerts = [];
@@ -219,8 +221,9 @@ async function scanLedgerRange(options, progress, gate) {
       gate
     );
 
-    const inRangeTrades = trades
-      .filter((trade) => trade.ledgerIndex >= startLedger && trade.ledgerIndex <= endLedger)
+    const inRangeTrades = aggregateTradesByTransaction(
+      trades.filter((trade) => trade.ledgerIndex >= startLedger && trade.ledgerIndex <= endLedger)
+    )
       .sort(compareTrades);
 
     let pairAlerts = 0;
@@ -511,10 +514,14 @@ function scoreSandwich(frontRun, victimTrade, backRun, options) {
   const estimatedProfitBps = estimateProfitBps(frontRun, backRun);
   if (estimatedProfitBps < options.minProfitBps) return null;
 
+  const closedBaseVolume = closedRoundTripBaseVolume(frontRun, backRun, options);
+  if (closedBaseVolume === null) return null;
+
   const reasons = [
     "same attacker taker submitted two opposite-side trades",
     "victim trade sits between attacker trades in ledger order",
     "victim execution rate moved against the victim after the attacker entry",
+    "attacker back-run closes a meaningful amount of the front-run position",
     `estimated round-trip edge ${estimatedProfitBps.toFixed(2)} bps`
   ];
   let confidence = 0.55 + Math.min(0.2, estimatedProfitBps / 250);
@@ -539,6 +546,7 @@ function scoreSandwich(frontRun, victimTrade, backRun, options) {
     victimRate: victimTrade.rate,
     exitRate: backRun.rate,
     estimatedProfitBps: Number(estimatedProfitBps.toFixed(4)),
+    closedBaseVolume: Number(closedBaseVolume.toFixed(6)),
     ledgerSpan: backRun.ledgerIndex - frontRun.ledgerIndex,
     frontRun,
     victimTrade,
@@ -572,6 +580,41 @@ function classifyTrade(trade) {
   return { ...trade, side };
 }
 
+function aggregateTradesByTransaction(trades) {
+  const groups = new Map();
+
+  for (const trade of trades) {
+    const classified = classifyTrade(trade);
+    const key = [
+      classified.txHash,
+      classified.pair,
+      classified.taker,
+      classified.side,
+      classified.ledgerIndex,
+      classified.txIndex
+    ].join("|");
+    const quoteVolume = classified.volumeQuote || classified.volumeBase * classified.rate;
+    const existing = groups.get(key);
+
+    if (!existing) {
+      groups.set(key, {
+        ...trade,
+        volumeQuote: quoteVolume,
+        fillCount: 1
+      });
+      continue;
+    }
+
+    existing.volumeBase += classified.volumeBase;
+    existing.volumeQuote += quoteVolume;
+    existing.rate = existing.volumeBase > 0 ? existing.volumeQuote / existing.volumeBase : existing.rate;
+    existing.fillCount += 1;
+    if (existing.provider !== classified.provider) existing.provider = "multiple";
+  }
+
+  return [...groups.values()];
+}
+
 function summarizeAlert(alert) {
   return {
     type: alert.type,
@@ -580,6 +623,7 @@ function summarizeAlert(alert) {
     attacker: alert.attacker,
     victim: alert.victim,
     estimatedProfitBps: alert.estimatedProfitBps,
+    closedBaseVolume: alert.closedBaseVolume,
     ledgerSpan: alert.ledgerSpan,
     frontRun: compactTrade(alert.frontRun),
     victimTrade: compactTrade(alert.victimTrade),
@@ -610,10 +654,7 @@ function enrichAlertSummary(alert) {
 }
 
 function estimateXrpImpact(alert) {
-  const frontCashflow = xrpCashflow(alert.pair, alert.frontRun);
-  const backCashflow = xrpCashflow(alert.pair, alert.backRun);
-  let attackerProfitXrp =
-    frontCashflow === null || backCashflow === null ? null : frontCashflow + backCashflow;
+  let attackerProfitXrp = closedRoundTripProfitXrp(alert);
 
   const frontFee = Number(alert.frontRun.feeDrops || 0) / 1_000_000;
   const backFee = Number(alert.backRun.feeDrops || 0) / 1_000_000;
@@ -628,17 +669,23 @@ function estimateXrpImpact(alert) {
   };
 }
 
-function xrpCashflow(pair, trade) {
-  const { base, counter } = splitPair(pair);
+function closedRoundTripProfitXrp(alert) {
+  const { base, counter } = splitPair(alert.pair);
+  const closedBaseVolume = Math.min(alert.frontRun.volumeBase, alert.backRun.volumeBase);
+
   if (counter === "XRP") {
-    const xrpValue = trade.volumeBase * trade.rate;
-    if (trade.side === "buy_base") return -xrpValue;
-    if (trade.side === "sell_base") return xrpValue;
+    if (alert.frontRun.side === "buy_base" && alert.backRun.side === "sell_base") {
+      return closedBaseVolume * (alert.backRun.rate - alert.frontRun.rate);
+    }
+    if (alert.frontRun.side === "sell_base" && alert.backRun.side === "buy_base") {
+      return closedBaseVolume * (alert.frontRun.rate - alert.backRun.rate);
+    }
   }
+
   if (base === "XRP") {
-    if (trade.side === "buy_base") return trade.volumeBase;
-    if (trade.side === "sell_base") return -trade.volumeBase;
+    return null;
   }
+
   return null;
 }
 
@@ -837,7 +884,8 @@ function formPayload() {
     maxLedgerGap: 1,
     maxTxGap: 60,
     maxCrossLedgerTxGap: 60,
-    minVictimVolumeRatio: 0.15
+    minVictimVolumeRatio: 0.15,
+    minRoundTripVolumeRatio: 0.5
   };
 }
 
@@ -926,6 +974,14 @@ function victimRateMovedAgainstTrade(frontRun, victimTrade, options) {
   if (frontRun.side === "buy_base") return victimTrade.rate > frontRun.rate * minMove;
   if (frontRun.side === "sell_base") return victimTrade.rate < frontRun.rate * maxMove;
   return false;
+}
+
+function closedRoundTripBaseVolume(frontRun, backRun, options) {
+  if (frontRun.volumeBase <= 0 || backRun.volumeBase <= 0) return null;
+  const closedBaseVolume = Math.min(frontRun.volumeBase, backRun.volumeBase);
+  const largestLegVolume = Math.max(frontRun.volumeBase, backRun.volumeBase);
+  const overlapRatio = closedBaseVolume / largestLegVolume;
+  return overlapRatio >= options.minRoundTripVolumeRatio ? closedBaseVolume : null;
 }
 
 function isCloseEnough(a, b, options) {
