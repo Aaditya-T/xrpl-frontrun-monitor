@@ -1,0 +1,36 @@
+{
+  "name": "xrpl-frontrun-monitor",
+  "version": "0.1.0",
+  "description": "XRPL DEX sandwich/front-running monitor using XRPLData streams and backfill APIs.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Aaditya-T/xrpl-frontrun-monitor.git"
+  },
+  "keywords": [
+    "xrpl",
+    "xrp-ledger",
+    "dex",
+    "amm",
+    "frontrunning",
+    "sandwich-attack",
+    "defi"
+  ],
+  "bin": {
+    "xrpl-frontrun-monitor": "./src/index.js"
+  },
+  "scripts": {
+    "start": "node ./src/index.js",
+    "backfill": "node ./src/index.js backfill",
+    "scan": "node ./src/index.js scan",
+    "dashboard": "node ./src/dashboard-server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

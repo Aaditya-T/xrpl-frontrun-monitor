@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>XRPL Front-Run Monitor</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="topbar">
+        <div>
+          <p class="eyebrow">XRPL DEX / AMM</p>
+          <h1>Front-Run Monitor</h1>
+        </div>
+        <div class="topbar-actions">
+          <button id="guide-open" class="button-secondary" type="button">Guide</button>
+          <div class="status" id="status">Checking ledger...</div>
+        </div>
+      </section>
+
+      <section class="scan-panel">
+        <div class="quick-ranges" aria-label="Quick ranges"></div>
+        <form id="scan-form" class="controls">
+          <label>
+            <span>From</span>
+            <input id="start-time" name="startTime" type="datetime-local" required />
+          </label>
+          <label>
+            <span>To</span>
+            <input id="end-time" name="endTime" type="datetime-local" required />
+          </label>
+          <label>
+            <span>Pairs</span>
+            <input id="pairs" name="pairs" type="number" min="1" max="100" value="25" />
+          </label>
+          <label>
+            <span>Min Exchanges</span>
+            <input id="min-exchanges" name="minExchanges" type="number" min="1" value="20" />
+          </label>
+          <label>
+            <span>Min Profit BPS</span>
+            <input id="min-profit-bps" name="minProfitBps" type="number" min="0" step="0.1" value="3" />
+          </label>
+          <label>
+            <span>Rows</span>
+            <select id="page-size" name="pageSize">
+              <option value="10">10</option>
+              <option value="25" selected>25</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+          </label>
+          <label class="check">
+            <input id="include-amm" name="includeAmm" type="checkbox" checked />
+            <span>Include AMM</span>
+          </label>
+          <button id="scan-button" type="submit">Run Scan</button>
+        </form>
+        <details class="advanced">
+          <summary>Advanced ledger override</summary>
+          <div class="advanced-grid">
+            <label>
+              <span>Start Ledger</span>
+              <input id="start-ledger" name="startLedger" inputmode="numeric" placeholder="optional" />
+            </label>
+            <label>
+              <span>End Ledger</span>
+              <input id="end-ledger" name="endLedger" inputmode="numeric" placeholder="optional" />
+            </label>
+          </div>
+        </details>
+        <div class="progress-panel" id="progress-panel" hidden>
+          <div class="progress-copy">
+            <span id="progress-label">Preparing scan</span>
+            <strong id="progress-percent">0%</strong>
+          </div>
+          <div class="progress-track">
+            <div class="progress-bar" id="progress-bar"></div>
+          </div>
+          <div class="progress-meta">
+            <span id="progress-detail">Waiting for data</span>
+            <span id="rate-limit">Rate limit: calibrating…</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="metrics" id="metrics">
+        <article>
+          <span>Candidate Alerts</span>
+          <strong id="metric-alerts">0</strong>
+        </article>
+        <article>
+          <span>Same Ledger</span>
+          <strong id="metric-same-ledger">0</strong>
+        </article>
+        <article>
+          <span>XRP Pairs</span>
+          <strong id="metric-xrp-pairs">0</strong>
+        </article>
+        <article>
+          <span>Attacker Profit XRP</span>
+          <strong id="metric-profit">0</strong>
+        </article>
+        <article>
+          <span>Victim Loss XRP</span>
+          <strong id="metric-loss">0</strong>
+        </article>
+      </section>
+
+      <section class="content-grid">
+        <div class="table-wrap">
+          <div class="section-head">
+            <h2>Estimated Victims</h2>
+            <span id="range-label">No scan yet</span>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>Score</th>
+                <th>Pair</th>
+                <th>Victim</th>
+                <th>Attacker</th>
+                <th>Profit XRP</th>
+                <th>Loss XRP</th>
+                <th>Ledger</th>
+                <th>Signal</th>
+              </tr>
+            </thead>
+            <tbody id="alerts-body">
+              <tr>
+                <td colspan="8" class="empty">Run a scan to populate candidates.</td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="pager" id="pager" hidden>
+            <button id="prev-page" type="button">Prev</button>
+            <span id="page-label">Page 1 of 1</span>
+            <button id="next-page" type="button">Next</button>
+          </div>
+        </div>
+
+        <aside class="details" id="details">
+          <div class="section-head">
+            <h2>Alert Details</h2>
+          </div>
+          <p class="empty-detail">Select a candidate to inspect the transaction path.</p>
+        </aside>
+      </section>
+    </main>
+
+    <dialog id="guide-dialog" class="guide-dialog" aria-labelledby="guide-title">
+      <div class="guide-shell">
+        <header class="guide-header">
+          <div>
+            <p class="eyebrow">How to use</p>
+            <h2 id="guide-title">Front-Run Monitor Guide</h2>
+          </div>
+          <button id="guide-close" class="button-secondary" type="button" aria-label="Close guide">Close</button>
+        </header>
+
+        <div class="guide-body">
+          <section>
+            <h3>What this tool does</h3>
+            <p>
+              This dashboard scans XRPL DEX and AMM exchange trades for <strong>probable sandwich / front-run patterns</strong>:
+              an attacker trade, a victim trade on the same pair and side, then the attacker's opposite-side exit.
+              Matches are scored as candidates — not proven theft.
+            </p>
+          </section>
+
+          <section>
+            <h3>Quick start</h3>
+            <ol class="guide-steps">
+              <li>Pick a time range with the <strong>1d / 7d / 30d / 90d</strong> pills or set <strong>From</strong> and <strong>To</strong>.</li>
+              <li>Adjust scan settings (pairs, filters) if needed.</li>
+              <li>Click <strong>Run Scan</strong>. Requests run in your browser against the free XRPLData API.</li>
+              <li>Review ranked candidates in the table; click a row for front-run, victim, and back-run details.</li>
+            </ol>
+          </section>
+
+          <section>
+            <h3>Scan settings</h3>
+            <dl class="guide-fields">
+              <div>
+                <dt>From / To</dt>
+                <dd>Calendar range for the scan. Converted to ledger indexes via <code>GET /ledgers/ledger_index?date=...</code>. Exchange trades are fetched for this exact window.</dd>
+              </div>
+              <div>
+                <dt>Quick ranges (1d, 7d, 30d, 90d)</dt>
+                <dd>Presets that set From/To relative to the latest ledger close time. Long ranges use a valid API ticker window (e.g. 90d scan uses a <code>13w</code> pair-activity lookup).</dd>
+              </div>
+              <div>
+                <dt>Pairs</dt>
+                <dd>How many of the busiest pairs to scan (max 100). Only the top pairs by exchange count in the activity window are included.</dd>
+              </div>
+              <div>
+                <dt>Min Exchanges</dt>
+                <dd>Minimum trade count a pair must have in the ticker window to be considered active.</dd>
+              </div>
+              <div>
+                <dt>Min Profit BPS</dt>
+                <dd>Minimum estimated round-trip edge (basis points) between the attacker's front-run and back-run legs.</dd>
+              </div>
+              <div>
+                <dt>Rows</dt>
+                <dd>Page size for the results table after a scan completes.</dd>
+              </div>
+              <div>
+                <dt>Include AMM</dt>
+                <dd>When checked, AMM swaps are included. Uncheck to scan DEX offer trades only.</dd>
+              </div>
+              <div>
+                <dt>Advanced ledger override</dt>
+                <dd>Optional exact <code>startLedger</code> / <code>endLedger</code> bounds instead of date mapping.</dd>
+              </div>
+            </dl>
+          </section>
+
+          <section>
+            <h3>How a scan works</h3>
+            <ol class="guide-pipeline">
+              <li><strong>Resolve range</strong> — map dates (or ledger overrides) to ledger indexes.</li>
+              <li><strong>Find active pairs</strong> — <code>GET /iou/ticker_data/all</code> with an API-valid interval; sort by exchange volume; take the top <em>Pairs</em>.</li>
+              <li><strong>Fetch trades</strong> — for each pair, <code>GET /iou/exchanges/{base}/{counter}</code> with your <em>From/To</em> timestamps (up to 8,000 trades per pair).</li>
+              <li><strong>Detect patterns</strong> — look for same-taker opposite-side sequences with a victim trade between attacker legs (same or adjacent ledger).</li>
+              <li><strong>Estimate impact</strong> — XRP profit/loss where the pair is XRP-quoted; otherwise <em>n/a</em>.</li>
+            </ol>
+            <p class="guide-note">
+              API calls run client-side so rate limits apply per browser session (~180 requests per minute).
+              Progress and the rate-limit counter reflect that budget.
+            </p>
+          </section>
+
+          <section>
+            <h3>Reading results</h3>
+            <dl class="guide-fields">
+              <div>
+                <dt>Score</dt>
+                <dd>Confidence (0–100%) from pattern strength: profit edge, ledger proximity, victim size, and optional sequence signals.</dd>
+              </div>
+              <div>
+                <dt>Profit XRP / Loss XRP</dt>
+                <dd>Estimated attacker profit and victim loss for XRP pairs. Fees are subtracted from profit where available.</dd>
+              </div>
+              <div>
+                <dt>Signal</dt>
+                <dd><em>Same ledger</em> = all three legs in one ledger (stronger). <em>Near ledger</em> = adjacent ledgers.</dd>
+              </div>
+              <div>
+                <dt>Summary metrics</dt>
+                <dd>Totals across all candidates: alert count, same-ledger count, XRP-pair alerts, and summed profit/loss estimates.</dd>
+              </div>
+            </dl>
+          </section>
+
+          <section>
+            <h3>Limits to know</h3>
+            <ul class="guide-list">
+              <li>Scans the top <em>Pairs</em> only — not every market on the XRPL.</li>
+              <li>Up to <strong>8,000 trades per pair</strong> (8 paginated API pages). Very active pairs may be truncated.</li>
+              <li>Results are heuristic candidates; verify on-chain before treating them as confirmed front-runs.</li>
+            </ul>
+          </section>
+
+          <section class="guide-credit">
+            <h3>Data source &amp; thanks</h3>
+            <p>
+              Trade and ledger data are provided by the
+              <a href="https://xrpldata.inftf.org/docs" target="_blank" rel="noopener noreferrer">XRPL Data API</a>
+              from <a href="https://inftf.org/" target="_blank" rel="noopener noreferrer"><strong>InFTF</strong></a>
+              (Inclusive Financial Technology Foundation).
+              Thank you to InFTF for operating this free, public REST API and making XRPL DEX/AMM history accessible.
+            </p>
+            <p class="guide-note">
+              This dashboard is an independent analysis tool and is not affiliated with or endorsed by InFTF.
+            </p>
+          </section>
+        </div>
+      </div>
+    </dialog>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
