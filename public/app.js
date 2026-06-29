@@ -498,9 +498,11 @@ class SandwichDetector {
       });
 
       for (const victimTrade of victims) {
-        const alert = scoreSandwich(frontRun, victimTrade, backRun, this.options);
+        const alert = tradeIncludesAccount(victimTrade, backRun.taker)
+          ? scoreDirectFillSandwich(frontRun, victimTrade, backRun, this.options)
+          : scoreSandwich(frontRun, victimTrade, backRun, this.options);
         if (!alert) continue;
-        const key = `${frontRun.txHash}:${victimTrade.txHash}:${backRun.txHash}`;
+        const key = `${alert.type}:${frontRun.txHash}:${victimTrade.txHash}:${backRun.txHash}`;
         if (this.seenAlertKeys.has(key)) continue;
         this.seenAlertKeys.add(key);
         alerts.push(alert);
@@ -554,6 +556,49 @@ function scoreSandwich(frontRun, victimTrade, backRun, options) {
   };
 }
 
+function scoreDirectFillSandwich(frontRun, victimTrade, backRun, options) {
+  const roundTrip = directFillRoundTrip(frontRun, victimTrade, backRun, options);
+  if (!roundTrip || roundTrip.edgeBps < options.minProfitBps) return null;
+
+  const reasons = [
+    "same attacker taker entered before the victim and exited after",
+    "victim transaction directly filled part of the attacker exit",
+    "victim execution rate moved against the victim after the attacker entry",
+    "attacker exit volume meaningfully closes the front-run position",
+    `estimated closed-position edge ${roundTrip.edgeBps.toFixed(2)} bps`
+  ];
+  let confidence = 0.62 + Math.min(0.18, roundTrip.edgeBps / 300);
+
+  if (frontRun.ledgerIndex === victimTrade.ledgerIndex && victimTrade.ledgerIndex === backRun.ledgerIndex) {
+    confidence += 0.12;
+    reasons.push("all three transactions landed in the same ledger");
+  }
+
+  if (roundTrip.directExit.volumeBase >= frontRun.volumeBase * 0.1) {
+    confidence += 0.04;
+    reasons.push("victim filled a material part of the attacker exit");
+  }
+
+  return {
+    type: "probable_direct_fill_sandwich",
+    confidence: Number(Math.min(confidence, 0.98).toFixed(3)),
+    reasons,
+    pair: frontRun.pair,
+    attacker: frontRun.taker,
+    victim: victimTrade.taker,
+    entryRate: frontRun.rate,
+    victimRate: victimTrade.rate,
+    exitRate: roundTrip.exitRate,
+    estimatedProfitBps: Number(roundTrip.edgeBps.toFixed(4)),
+    closedBaseVolume: Number(roundTrip.closedBaseVolume.toFixed(6)),
+    ledgerSpan: backRun.ledgerIndex - frontRun.ledgerIndex,
+    frontRun,
+    victimTrade,
+    directExitTrade: roundTrip.directExit,
+    backRun
+  };
+}
+
 function normalizeRestExchange(exchange, pair, syntheticTxIndex = 0) {
   if (!exchange?.tx_hash || exchange.ledger_index === undefined) return null;
   return {
@@ -593,26 +638,58 @@ function aggregateTradesByTransaction(trades) {
       classified.ledgerIndex,
       classified.txIndex
     ].join("|");
-    const quoteVolume = classified.volumeQuote || classified.volumeBase * classified.rate;
+    const fill = {
+      ...classified,
+      volumeQuote: quoteVolume(classified)
+    };
+    const aggregateQuoteVolume = fill.volumeQuote;
     const existing = groups.get(key);
 
     if (!existing) {
       groups.set(key, {
         ...trade,
-        volumeQuote: quoteVolume,
+        volumeQuote: aggregateQuoteVolume,
+        participantAccounts: tradeParticipantAccounts(classified),
+        fills: [fill],
         fillCount: 1
       });
       continue;
     }
 
     existing.volumeBase += classified.volumeBase;
-    existing.volumeQuote += quoteVolume;
+    existing.volumeQuote += aggregateQuoteVolume;
     existing.rate = existing.volumeBase > 0 ? existing.volumeQuote / existing.volumeBase : existing.rate;
+    existing.participantAccounts = uniqueAccounts([
+      ...(existing.participantAccounts || []),
+      ...tradeParticipantAccounts(classified)
+    ]);
+    existing.fills.push(fill);
     existing.fillCount += 1;
+    if (existing.buyer !== classified.buyer) existing.buyer = "multiple";
+    if (existing.seller !== classified.seller) existing.seller = "multiple";
     if (existing.provider !== classified.provider) existing.provider = "multiple";
   }
 
   return [...groups.values()];
+}
+
+function tradeIncludesAccount(trade, account) {
+  if (!account) return false;
+  return tradeParticipantAccounts(trade).includes(account);
+}
+
+function tradeParticipantAccounts(trade) {
+  return uniqueAccounts([
+    ...(Array.isArray(trade.participantAccounts) ? trade.participantAccounts : []),
+    trade.taker,
+    trade.buyer,
+    trade.seller,
+    trade.provider
+  ]);
+}
+
+function uniqueAccounts(accounts) {
+  return [...new Set(accounts.filter(Boolean).filter((account) => account !== "multiple"))];
 }
 
 function summarizeAlert(alert) {
@@ -627,6 +704,7 @@ function summarizeAlert(alert) {
     ledgerSpan: alert.ledgerSpan,
     frontRun: compactTrade(alert.frontRun),
     victimTrade: compactTrade(alert.victimTrade),
+    directExitTrade: alert.directExitTrade ? compactTrade(alert.directExitTrade) : undefined,
     backRun: compactTrade(alert.backRun),
     reasons: alert.reasons
   };
@@ -640,6 +718,7 @@ function compactTrade(trade) {
     volumeBase: trade.volumeBase,
     volumeQuote: trade.volumeQuote,
     taker: trade.taker,
+    fillCount: trade.fillCount,
     ledgerIndex: trade.ledgerIndex,
     txIndex: trade.txIndex
   };
@@ -670,6 +749,8 @@ function estimateXrpImpact(alert) {
 }
 
 function closedRoundTripProfitXrp(alert) {
+  if (alert.directExitTrade) return directFillProfitXrp(alert);
+
   const { base, counter } = splitPair(alert.pair);
   const closedBaseVolume = Math.min(alert.frontRun.volumeBase, alert.backRun.volumeBase);
 
@@ -687,6 +768,109 @@ function closedRoundTripProfitXrp(alert) {
   }
 
   return null;
+}
+
+function directFillRoundTrip(frontRun, victimTrade, backRun, options) {
+  const directExit = attackerExitFromVictimTrade(frontRun, victimTrade);
+  if (!directExit || directExit.volumeBase <= 0 || backRun.volumeBase <= 0) return null;
+
+  const totalExitBase = directExit.volumeBase + backRun.volumeBase;
+  const closedBaseVolume = Math.min(frontRun.volumeBase, totalExitBase);
+  const largestLegVolume = Math.max(frontRun.volumeBase, totalExitBase);
+  if (closedBaseVolume / largestLegVolume < options.minRoundTripVolumeRatio) return null;
+
+  const frontQuoteUsed = proratedQuote(frontRun, closedBaseVolume);
+  const directBaseUsed = Math.min(directExit.volumeBase, closedBaseVolume);
+  const directQuoteUsed = proratedQuote(directExit, directBaseUsed);
+  const remainingBase = Math.max(0, closedBaseVolume - directBaseUsed);
+  const backQuoteUsed = proratedQuote(backRun, remainingBase);
+  const exitQuoteUsed = directQuoteUsed + backQuoteUsed;
+  if (frontQuoteUsed <= 0 || exitQuoteUsed <= 0) return null;
+
+  const profitQuote = frontRun.side === "buy_base"
+    ? exitQuoteUsed - frontQuoteUsed
+    : frontQuoteUsed - exitQuoteUsed;
+  const edgeBps = (profitQuote / frontQuoteUsed) * 10_000;
+  const exitRate = exitQuoteUsed / closedBaseVolume;
+
+  return {
+    closedBaseVolume,
+    edgeBps,
+    directExit: {
+      ...directExit,
+      rate: directExit.volumeBase > 0 ? directExit.volumeQuote / directExit.volumeBase : 0
+    },
+    exitRate
+  };
+}
+
+function directFillProfitXrp(alert) {
+  const { counter } = splitPair(alert.pair);
+  if (counter !== "XRP") return null;
+
+  const closedBaseVolume = Math.min(
+    alert.frontRun.volumeBase,
+    alert.directExitTrade.volumeBase + alert.backRun.volumeBase
+  );
+  const frontQuoteUsed = proratedQuote(alert.frontRun, closedBaseVolume);
+  const directBaseUsed = Math.min(alert.directExitTrade.volumeBase, closedBaseVolume);
+  const directQuoteUsed = proratedQuote(alert.directExitTrade, directBaseUsed);
+  const remainingBase = Math.max(0, closedBaseVolume - directBaseUsed);
+  const backQuoteUsed = proratedQuote(alert.backRun, remainingBase);
+
+  if (alert.frontRun.side === "buy_base") {
+    return directQuoteUsed + backQuoteUsed - frontQuoteUsed;
+  }
+  if (alert.frontRun.side === "sell_base") {
+    return frontQuoteUsed - directQuoteUsed - backQuoteUsed;
+  }
+  return null;
+}
+
+function attackerExitFromVictimTrade(frontRun, victimTrade) {
+  const fills = Array.isArray(victimTrade.fills) ? victimTrade.fills : [victimTrade];
+  const attacker = frontRun.taker;
+  const exitFills = fills.filter((fill) => {
+    if (frontRun.side === "buy_base") {
+      return fill.seller === attacker || fill.provider === attacker;
+    }
+    if (frontRun.side === "sell_base") {
+      return fill.buyer === attacker || fill.provider === attacker;
+    }
+    return false;
+  });
+
+  if (!exitFills.length) return null;
+
+  const volumeBase = exitFills.reduce((total, fill) => total + fill.volumeBase, 0);
+  const volumeQuote = exitFills.reduce((total, fill) => total + quoteVolume(fill), 0);
+  return {
+    txHash: victimTrade.txHash,
+    pair: victimTrade.pair,
+    side: oppositeSide(frontRun.side),
+    rate: volumeBase > 0 ? volumeQuote / volumeBase : 0,
+    volumeBase,
+    volumeQuote,
+    taker: frontRun.taker,
+    ledgerIndex: victimTrade.ledgerIndex,
+    txIndex: victimTrade.txIndex,
+    fillCount: exitFills.length
+  };
+}
+
+function proratedQuote(trade, baseVolume) {
+  if (baseVolume <= 0 || trade.volumeBase <= 0) return 0;
+  return quoteVolume(trade) * Math.min(1, baseVolume / trade.volumeBase);
+}
+
+function quoteVolume(trade) {
+  return trade.volumeQuote || trade.volumeBase * trade.rate;
+}
+
+function oppositeSide(side) {
+  if (side === "buy_base") return "sell_base";
+  if (side === "sell_base") return "buy_base";
+  return "unknown";
 }
 
 function estimateVictimLoss(alert) {
@@ -743,7 +927,7 @@ function renderAlerts() {
   alertsBody.innerHTML = pageAlerts
     .map((alert, offset) => {
       const index = start + offset;
-      const signal = alert.ledgerSpan === 0 ? "same ledger" : "near ledger";
+      const signal = alertSignalLabel(alert);
       const signalClass = alert.ledgerSpan === 0 ? "" : "warn";
       return `<tr data-index="${index}">
         <td>${Math.round(alert.confidence * 100)}%</td>
@@ -793,13 +977,19 @@ function renderDetails(alert) {
         <dt>Profit XRP</dt><dd>${formatNullable(alert.impact.attackerProfitXrp)}</dd>
         <dt>Victim Loss</dt><dd>${formatNullable(alert.impact.victimLossXrp)}</dd>
         <dt>Edge</dt><dd>${fmt.format(alert.estimatedProfitBps)} bps</dd>
-        <dt>Signal</dt><dd>${alert.ledgerSpan === 0 ? "same-ledger pattern" : "near-ledger pattern"}</dd>
+        <dt>Signal</dt><dd>${escapeHtml(alertSignalLabel(alert))}</dd>
         <dt>Source</dt><dd>XRPLData exchanges</dd>
       </dl>
       ${txCard("Front-run", alert.frontRun)}
       ${txCard("Victim", alert.victimTrade)}
+      ${alert.directExitTrade ? txCard("Victim-filled exit", alert.directExitTrade) : ""}
       ${txCard("Back-run", alert.backRun)}
     </div>`;
+}
+
+function alertSignalLabel(alert) {
+  if (alert.type === "probable_direct_fill_sandwich") return "direct-fill sandwich";
+  return alert.ledgerSpan === 0 ? "same ledger" : "near ledger";
 }
 
 function txCard(title, tx) {
