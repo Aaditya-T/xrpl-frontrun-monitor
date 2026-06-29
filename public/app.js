@@ -9,7 +9,9 @@ const DEFAULT_DETECTOR = {
   minProfitBps: 3,
   maxLedgerGap: 1,
   maxTxGap: 60,
+  maxCrossLedgerTxGap: 60,
   minVictimVolumeRatio: 0.15,
+  minVictimRateMoveBps: 0,
   historySize: 2500
 };
 
@@ -186,6 +188,7 @@ async function scanLedgerRange(options, progress, gate) {
     minProfitBps: options.minProfitBps,
     maxLedgerGap: options.maxLedgerGap,
     maxTxGap: options.maxTxGap,
+    maxCrossLedgerTxGap: options.maxCrossLedgerTxGap ?? DEFAULT_DETECTOR.maxCrossLedgerTxGap,
     minVictimVolumeRatio: options.minVictimVolumeRatio
   };
 
@@ -487,6 +490,7 @@ class SandwichDetector {
         if (trade.taker === backRun.taker) return false;
         if (trade.side !== frontRun.side) return false;
         if (!isBetween(frontRun, trade, backRun)) return false;
+        if (!victimRateMovedAgainstTrade(frontRun, trade, this.options)) return false;
         return trade.volumeBase >= frontRun.volumeBase * this.options.minVictimVolumeRatio;
       });
 
@@ -510,6 +514,7 @@ function scoreSandwich(frontRun, victimTrade, backRun, options) {
   const reasons = [
     "same attacker taker submitted two opposite-side trades",
     "victim trade sits between attacker trades in ledger order",
+    "victim execution rate moved against the victim after the attacker entry",
     `estimated round-trip edge ${estimatedProfitBps.toFixed(2)} bps`
   ];
   let confidence = 0.55 + Math.min(0.2, estimatedProfitBps / 250);
@@ -555,7 +560,7 @@ function normalizeRestExchange(exchange, pair, syntheticTxIndex = 0) {
     provider: exchange.provider ? String(exchange.provider) : "",
     isAmm: Boolean(exchange.provider_is_amm),
     ledgerIndex: toNumber(exchange.ledger_index),
-    txIndex: toNumber(exchange.tx_index ?? syntheticTxIndex),
+    txIndex: exchange.tx_index === undefined ? syntheticTxIndex : toNumber(exchange.tx_index),
     ledgerCloseTimeUtc: exchange.executed_time ? String(exchange.executed_time) : ""
   };
 }
@@ -797,10 +802,15 @@ function renderRateLimit() {
 }
 
 function summarizeTotals(alerts) {
-  const totalAttackerProfitXrp = alerts.reduce(
-    (total, alert) => total + Math.max(0, alert.impact.attackerProfitXrp ?? 0),
-    0
-  );
+  const countedRoundTrips = new Set();
+  let totalAttackerProfitXrp = 0;
+  for (const alert of alerts) {
+    const roundTripKey = `${alert.frontRun.txHash}:${alert.backRun.txHash}`;
+    if (countedRoundTrips.has(roundTripKey)) continue;
+    countedRoundTrips.add(roundTripKey);
+    totalAttackerProfitXrp += Math.max(0, alert.impact.attackerProfitXrp ?? 0);
+  }
+
   const totalVictimLossXrp = alerts.reduce(
     (total, alert) => total + Math.max(0, alert.impact.victimLossXrp ?? 0),
     0
@@ -826,6 +836,7 @@ function formPayload() {
     excludeAmm: !document.querySelector("#include-amm").checked,
     maxLedgerGap: 1,
     maxTxGap: 60,
+    maxCrossLedgerTxGap: 60,
     minVictimVolumeRatio: 0.15
   };
 }
@@ -907,10 +918,21 @@ function estimateProfitBps(frontRun, backRun) {
   return 0;
 }
 
+function victimRateMovedAgainstTrade(frontRun, victimTrade, options) {
+  if (frontRun.rate <= 0 || victimTrade.rate <= 0) return false;
+  const minMove = 1 + (options.minVictimRateMoveBps || 0) / 10_000;
+  const maxMove = 1 - (options.minVictimRateMoveBps || 0) / 10_000;
+
+  if (frontRun.side === "buy_base") return victimTrade.rate > frontRun.rate * minMove;
+  if (frontRun.side === "sell_base") return victimTrade.rate < frontRun.rate * maxMove;
+  return false;
+}
+
 function isCloseEnough(a, b, options) {
   const ledgerGap = Math.abs(b.ledgerIndex - a.ledgerIndex);
   if (ledgerGap > options.maxLedgerGap) return false;
   if (ledgerGap === 0 && Math.abs(b.txIndex - a.txIndex) > options.maxTxGap) return false;
+  if (ledgerGap > 0 && b.txIndex > options.maxCrossLedgerTxGap) return false;
   return compareTrades(a, b) < 0;
 }
 
